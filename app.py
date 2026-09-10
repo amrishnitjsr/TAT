@@ -239,57 +239,72 @@ def main() -> None:
             accept_multiple_files=False,
         )
 
-        # Option to save uploaded files into the repository and push to remote
+        # Save uploaded files into the repository folder on the app server (no push by default)
         st.markdown("---")
-        st.write("You can save uploaded files into the repo (folder: `uploaded_files/`) and attempt to push to remote.")
-        if st.button("Save uploaded files to repo"):
-            def save_upload_to_repo(uploaded_file, subdir="uploaded_files") -> str:
-                if uploaded_file is None:
-                    return "no_file"
+        st.write("Uploaded files are saved to the app server under `uploaded_files/`. By default this does NOT push to GitHub.")
+
+        def save_upload_to_repo(uploaded_file, subdir="uploaded_files") -> str:
+            if uploaded_file is None:
+                return "no_file"
+            try:
+                os.makedirs(subdir, exist_ok=True)
+                # ensure stream is at start
                 try:
-                    os.makedirs(subdir, exist_ok=True)
-                    # ensure stream is at start
-                    try:
-                        uploaded_file.seek(0)
-                    except Exception:
-                        pass
-                    data = uploaded_file.read()
-                    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                    safe_name = os.path.basename(uploaded_file.name)
-                    dest_name = f"{timestamp}_{safe_name}"
-                    dest_path = os.path.join(subdir, dest_name)
-                    with open(dest_path, "wb") as f:
-                        if isinstance(data, str):
-                            f.write(data.encode())
-                        else:
-                            f.write(data)
-                    return dest_path
-                except Exception as exc:
-                    return f"error:{exc}"
-
-            saved_paths = []
-            for f in (ready_upload, dispatch_upload):
-                if f is not None:
-                    res = save_upload_to_repo(f)
-                    saved_paths.append(res)
-
-            if not saved_paths:
-                st.warning("No uploaded files to save. Upload files first.")
-            else:
-                st.success("Saved files: " + ", ".join(saved_paths))
-
-                # attempt git add/commit/push
-                try:
-                    # add
-                    subprocess.run(["git", "add"] + saved_paths, check=True)
-                    commit_msg = f"Add uploaded files: {' ,'.join([os.path.basename(p) for p in saved_paths])}"
-                    subprocess.run(["git", "commit", "-m", commit_msg], check=True)
-                    push_proc = subprocess.run(["git", "push"], check=False, capture_output=True, text=True)
-                    if push_proc.returncode == 0:
-                        st.success("Pushed committed uploads to remote.")
+                    uploaded_file.seek(0)
+                except Exception:
+                    pass
+                data = uploaded_file.read()
+                timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                safe_name = os.path.basename(uploaded_file.name)
+                dest_name = f"{timestamp}_{safe_name}"
+                dest_path = os.path.join(subdir, dest_name)
+                with open(dest_path, "wb") as f:
+                    if isinstance(data, str):
+                        f.write(data.encode())
                     else:
-                        st.error("Commit created locally but push failed. See output below.")
-                        st.code(push_proc.stderr)
+                        f.write(data)
+                return dest_path
+            except Exception as exc:
+                return f"error:{exc}"
+
+        # Auto-save on first upload (avoids repeated saves during reruns)
+        if "saved_uploaded_paths" not in st.session_state:
+            st.session_state["saved_uploaded_paths"] = []
+
+        auto_saved = []
+        for label, f in [("ready", ready_upload), ("dispatch", dispatch_upload)]:
+            if f is not None:
+                # check if already saved (by original filename)
+                already = any(f.name in p for p in st.session_state["saved_uploaded_paths"])
+                if not already:
+                    p = save_upload_to_repo(f)
+                    if not p.startswith("error") and p != "no_file":
+                        st.session_state["saved_uploaded_paths"].append(p)
+                        auto_saved.append(p)
+
+        if auto_saved:
+            st.success("Auto-saved uploaded files: " + ", ".join(auto_saved))
+
+        st.write("If you also want to push saved files to GitHub, enable below and click the button.")
+        push_checkbox = st.checkbox("Also commit & push saved uploads to GitHub", value=False)
+        if st.button("Commit & push saved uploads"):
+            if not st.session_state["saved_uploaded_paths"]:
+                st.warning("No saved uploads to commit. Upload files first or use the auto-save above.")
+            else:
+                try:
+                    if push_checkbox:
+                        # add
+                        subprocess.run(["git", "add"] + st.session_state["saved_uploaded_paths"], check=True)
+                        commit_msg = f"Add uploaded files: {' ,'.join([os.path.basename(p) for p in st.session_state['saved_uploaded_paths']])}"
+                        subprocess.run(["git", "commit", "-m", commit_msg], check=True)
+                        push_proc = subprocess.run(["git", "push"], check=False, capture_output=True, text=True)
+                        if push_proc.returncode == 0:
+                            st.success("Pushed committed uploads to remote.")
+                        else:
+                            st.error("Commit created locally but push failed. See output below.")
+                            st.code(push_proc.stderr)
+                    else:
+                        st.info("Push not enabled — saved files remain on the app server only.")
                 except FileNotFoundError:
                     st.error("`git` not found in the server environment. Cannot commit/push from this app instance.")
                 except subprocess.CalledProcessError as cpe:
