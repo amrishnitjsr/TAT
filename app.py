@@ -1,6 +1,10 @@
 import io
 import os
 import subprocess
+import base64
+import json
+import urllib.request
+import urllib.error
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -267,6 +271,47 @@ def main() -> None:
             except Exception as exc:
                 return f"error:{exc}"
 
+        def _get_repo_owner_and_name() -> Optional[Tuple[str, str]]:
+            try:
+                raw = subprocess.check_output(["git", "config", "--get", "remote.origin.url"]).decode().strip()
+                # URL formats: https://github.com/owner/repo.git or git@github.com:owner/repo.git
+                if raw.startswith("http"):
+                    parts = raw.rstrip(".git").split("/")
+                    owner = parts[-2]
+                    repo = parts[-1]
+                    return owner, repo
+                if raw.startswith("git@"):
+                    # git@github.com:owner/repo.git
+                    path = raw.split(":", 1)[1].rstrip(".git")
+                    owner, repo = path.split("/", 1)
+                    return owner, repo
+            except Exception:
+                return None
+
+        def upload_file_to_github(local_path: str, repo_owner: str, repo_name: str, dest_path: str, token: str, branch: str = "main") -> Tuple[bool, str]:
+            try:
+                with open(local_path, "rb") as f:
+                    content = f.read()
+                b64 = base64.b64encode(content).decode("utf-8")
+                message = f"Add uploaded file {os.path.basename(local_path)}"
+                payload = {"message": message, "content": b64, "branch": branch}
+                url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents/{urllib.request.pathname2url(dest_path)}"
+                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method="PUT")
+                req.add_header("Authorization", f"token {token}")
+                req.add_header("Accept", "application/vnd.github+json")
+                req.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(req) as resp:
+                    resp_data = resp.read().decode("utf-8")
+                return True, "Uploaded to GitHub"
+            except urllib.error.HTTPError as he:
+                try:
+                    err = he.read().decode()
+                except Exception:
+                    err = str(he)
+                return False, f"HTTPError: {he.code} - {err}"
+            except Exception as exc:
+                return False, str(exc)
+
         # Auto-save on first upload (avoids repeated saves during reruns)
         if "saved_uploaded_paths" not in st.session_state:
             st.session_state["saved_uploaded_paths"] = []
@@ -281,6 +326,27 @@ def main() -> None:
                     if not p.startswith("error") and p != "no_file":
                         st.session_state["saved_uploaded_paths"].append(p)
                         auto_saved.append(p)
+
+                        # If a GitHub token is provided in Streamlit secrets, attempt API upload automatically
+                        gh_token = None
+                        try:
+                            gh_token = st.secrets.get("GITHUB_TOKEN") if st.secrets is not None else None
+                        except Exception:
+                            gh_token = None
+
+                        if gh_token:
+                            repo_info = _get_repo_owner_and_name()
+                            if repo_info:
+                                owner, repo = repo_info
+                                # destination path in repo: uploaded_files/<filename>
+                                dest = os.path.join("uploaded_files", os.path.basename(p))
+                                ok, msg = upload_file_to_github(p, owner, repo, dest, gh_token)
+                                if ok:
+                                    st.success(f"Auto-pushed {os.path.basename(p)} to GitHub/{owner}/{repo}:{dest}")
+                                else:
+                                    st.error(f"Auto-push failed: {msg}")
+                            else:
+                                st.error("Cannot determine GitHub repo owner/name from git remote; auto-push skipped.")
 
         if auto_saved:
             st.success("Auto-saved uploaded files: " + ", ".join(auto_saved))
