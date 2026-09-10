@@ -1,4 +1,7 @@
 import io
+import os
+import subprocess
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -68,6 +71,17 @@ def safe_selectbox(label: str, options: List[str], key: str) -> Optional[str]:
         st.error(f"No columns available for {label}.")
         return None
     return st.selectbox(label, options, key=key)
+
+
+def detect_column_by_keywords(columns: List[str], keywords: List[str]) -> Optional[str]:
+    """Return the first column that contains any of the keywords (case-insensitive)."""
+    low_cols = [c.lower() for c in columns]
+    for kw in keywords:
+        kw_low = kw.lower()
+        for orig, low in zip(columns, low_cols):
+            if kw_low in low:
+                return orig
+    return None
 
 
 def build_standardized_frame(
@@ -225,6 +239,64 @@ def main() -> None:
             accept_multiple_files=False,
         )
 
+        # Option to save uploaded files into the repository and push to remote
+        st.markdown("---")
+        st.write("You can save uploaded files into the repo (folder: `uploaded_files/`) and attempt to push to remote.")
+        if st.button("Save uploaded files to repo"):
+            def save_upload_to_repo(uploaded_file, subdir="uploaded_files") -> str:
+                if uploaded_file is None:
+                    return "no_file"
+                try:
+                    os.makedirs(subdir, exist_ok=True)
+                    # ensure stream is at start
+                    try:
+                        uploaded_file.seek(0)
+                    except Exception:
+                        pass
+                    data = uploaded_file.read()
+                    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+                    safe_name = os.path.basename(uploaded_file.name)
+                    dest_name = f"{timestamp}_{safe_name}"
+                    dest_path = os.path.join(subdir, dest_name)
+                    with open(dest_path, "wb") as f:
+                        if isinstance(data, str):
+                            f.write(data.encode())
+                        else:
+                            f.write(data)
+                    return dest_path
+                except Exception as exc:
+                    return f"error:{exc}"
+
+            saved_paths = []
+            for f in (ready_upload, dispatch_upload):
+                if f is not None:
+                    res = save_upload_to_repo(f)
+                    saved_paths.append(res)
+
+            if not saved_paths:
+                st.warning("No uploaded files to save. Upload files first.")
+            else:
+                st.success("Saved files: " + ", ".join(saved_paths))
+
+                # attempt git add/commit/push
+                try:
+                    # add
+                    subprocess.run(["git", "add"] + saved_paths, check=True)
+                    commit_msg = f"Add uploaded files: {' ,'.join([os.path.basename(p) for p in saved_paths])}"
+                    subprocess.run(["git", "commit", "-m", commit_msg], check=True)
+                    push_proc = subprocess.run(["git", "push"], check=False, capture_output=True, text=True)
+                    if push_proc.returncode == 0:
+                        st.success("Pushed committed uploads to remote.")
+                    else:
+                        st.error("Commit created locally but push failed. See output below.")
+                        st.code(push_proc.stderr)
+                except FileNotFoundError:
+                    st.error("`git` not found in the server environment. Cannot commit/push from this app instance.")
+                except subprocess.CalledProcessError as cpe:
+                    st.error(f"Git command failed: {cpe}")
+                except Exception as exc:
+                    st.error(f"Unexpected error while committing/pushing: {exc}")
+
         join_type = st.radio(
             "Merge Type",
             options=["inner", "outer"],
@@ -257,10 +329,70 @@ def main() -> None:
     dispatch_columns = get_available_columns(dispatch_df)
 
     st.sidebar.subheader("Column Mapping")
-    ready_product_col = safe_selectbox("Sheet 1: Product Identifier / Name", ready_columns, "ready_product_col")
-    ready_timestamp_col = safe_selectbox("Sheet 1: Ready Timestamp", ready_columns, "ready_timestamp_col")
-    dispatch_product_col = safe_selectbox("Sheet 2: Product Identifier / Name", dispatch_columns, "dispatch_product_col")
-    dispatch_timestamp_col = safe_selectbox("Sheet 2: Dispatch Timestamp", dispatch_columns, "dispatch_timestamp_col")
+    # Attempt to auto-detect likely columns based on common header keywords
+    ready_product_default = detect_column_by_keywords(
+        ready_columns,
+        [
+            "product",
+            "product id",
+            "material",
+            "item",
+            "goods",
+            "original line item",
+            "item automatically created",
+            "user name",
+        ],
+    )
+    ready_timestamp_default = detect_column_by_keywords(
+        ready_columns, ["ready", "ready timestamp", "production", "date", "time", "timestamp", "posting date"]
+    )
+
+    dispatch_product_default = detect_column_by_keywords(
+        dispatch_columns, ["product", "material", "item", "goods", "dispatch", "delivery"]
+    )
+    dispatch_timestamp_default = detect_column_by_keywords(
+        dispatch_columns, ["dispatch", "dispatch timestamp", "delivery date", "date", "time", "timestamp"]
+    )
+
+    if ready_product_default and ready_product_default in ready_columns:
+        ready_product_col = st.selectbox(
+            "Sheet 1: Product Identifier / Name",
+            ready_columns,
+            index=ready_columns.index(ready_product_default),
+            key="ready_product_col",
+        )
+    else:
+        ready_product_col = safe_selectbox("Sheet 1: Product Identifier / Name", ready_columns, "ready_product_col")
+
+    if ready_timestamp_default and ready_timestamp_default in ready_columns:
+        ready_timestamp_col = st.selectbox(
+            "Sheet 1: Ready Timestamp",
+            ready_columns,
+            index=ready_columns.index(ready_timestamp_default),
+            key="ready_timestamp_col",
+        )
+    else:
+        ready_timestamp_col = safe_selectbox("Sheet 1: Ready Timestamp", ready_columns, "ready_timestamp_col")
+
+    if dispatch_product_default and dispatch_product_default in dispatch_columns:
+        dispatch_product_col = st.selectbox(
+            "Sheet 2: Product Identifier / Name",
+            dispatch_columns,
+            index=dispatch_columns.index(dispatch_product_default),
+            key="dispatch_product_col",
+        )
+    else:
+        dispatch_product_col = safe_selectbox("Sheet 2: Product Identifier / Name", dispatch_columns, "dispatch_product_col")
+
+    if dispatch_timestamp_default and dispatch_timestamp_default in dispatch_columns:
+        dispatch_timestamp_col = st.selectbox(
+            "Sheet 2: Dispatch Timestamp",
+            dispatch_columns,
+            index=dispatch_columns.index(dispatch_timestamp_default),
+            key="dispatch_timestamp_col",
+        )
+    else:
+        dispatch_timestamp_col = safe_selectbox("Sheet 2: Dispatch Timestamp", dispatch_columns, "dispatch_timestamp_col")
 
     if not all([ready_product_col, ready_timestamp_col, dispatch_product_col, dispatch_timestamp_col]):
         st.stop()
